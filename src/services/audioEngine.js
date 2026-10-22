@@ -1,4 +1,4 @@
-// High-Performance Audio Engine for Multi-Agent Speech Synthesis
+// High-Performance Audio Engine for Multi-Agent Speech Synthesis with Concurrency Lock
 
 class AudioEngine {
   constructor() {
@@ -9,6 +9,7 @@ class AudioEngine {
     this.volume = 1.0;
     this.cachedVoices = [];
     this.activeSpeakerId = null;
+    this.currentSessionId = 0; // Incremented on every speech start or stop
 
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       this.initSpeechSynthesis();
@@ -40,14 +41,19 @@ class AudioEngine {
   }
 
   /**
-   * Stop any playing audio immediately (Critical for Interruptions!)
+   * Stop any playing audio immediately with strict session invalidation
+   * (Prevents voice overlap and race conditions!)
    */
   stop() {
+    this.currentSessionId++; // Invalidate any pending callbacks
     this.isPlaying = false;
     this.activeSpeakerId = null;
 
     if (this.currentAudio) {
       try {
+        this.currentAudio.onplay = null;
+        this.currentAudio.onended = null;
+        this.currentAudio.onerror = null;
         this.currentAudio.pause();
         this.currentAudio.currentTime = 0;
         this.currentAudio.src = '';
@@ -59,11 +65,16 @@ class AudioEngine {
 
     if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
       try {
+        if (this.currentUtterance) {
+          this.currentUtterance.onstart = null;
+          this.currentUtterance.onend = null;
+          this.currentUtterance.onerror = null;
+          this.currentUtterance = null;
+        }
         window.speechSynthesis.cancel();
       } catch (e) {
         console.warn('Error cancelling speech synthesis:', e);
       }
-      this.currentUtterance = null;
     }
   }
 
@@ -71,12 +82,11 @@ class AudioEngine {
    * Play speech using ElevenLabs API or Web Speech API Fallback
    */
   async playSpeech({ text, voiceId, speakerId, apiKey, onStart, onEnd, onError }) {
-    // Ensure prior audio is stopped completely
+    // 1. Immediately kill any prior audio & invalidate previous sessions
     this.stop();
-    this.isPlaying = true;
+    const sessionId = ++this.currentSessionId;
     this.activeSpeakerId = speakerId;
 
-    // Check if ElevenLabs API key is present
     const hasElevenKey = Boolean(apiKey && apiKey.trim().length > 5);
 
     if (hasElevenKey) {
@@ -91,10 +101,19 @@ class AudioEngine {
           })
         });
 
-        // Check if response is audio/mpeg
+        // If user cancelled / clicked next while fetching, discard this result!
+        if (sessionId !== this.currentSessionId) {
+          return;
+        }
+
         const contentType = response.headers.get('content-type') || '';
         if (response.ok && contentType.includes('audio')) {
           const blob = await response.blob();
+
+          if (sessionId !== this.currentSessionId) {
+            return;
+          }
+
           const audioUrl = URL.createObjectURL(blob);
           const audio = new Audio(audioUrl);
           audio.playbackRate = this.playbackRate;
@@ -102,45 +121,57 @@ class AudioEngine {
           this.currentAudio = audio;
 
           audio.onplay = () => {
+            if (sessionId !== this.currentSessionId) {
+              audio.pause();
+              return;
+            }
+            this.isPlaying = true;
             if (onStart) onStart({ mode: 'elevenlabs' });
           };
 
           audio.onended = () => {
+            URL.revokeObjectURL(audioUrl);
+            if (sessionId !== this.currentSessionId) return;
             this.isPlaying = false;
             this.activeSpeakerId = null;
-            URL.revokeObjectURL(audioUrl);
             if (onEnd) onEnd();
           };
 
           audio.onerror = (e) => {
-            console.warn('ElevenLabs audio playback error, falling back:', e);
             URL.revokeObjectURL(audioUrl);
-            this.playWithBrowserTTS({ text, speakerId, onStart, onEnd, onError });
+            if (sessionId !== this.currentSessionId) return;
+            console.warn('ElevenLabs playback error, falling back:', e);
+            this.playWithBrowserTTS({ text, speakerId, sessionId, onStart, onEnd, onError });
           };
 
           await audio.play();
           return;
         } else {
-          // Response was JSON error or fallback message
           const errData = await response.json().catch(() => ({}));
-          console.info('Using Web Speech fallback (ElevenLabs notice):', errData.message || errData.error);
+          console.info('ElevenLabs fallback notice:', errData.message || errData.error);
         }
       } catch (err) {
-        console.warn('ElevenLabs fetch failed, using Web Speech fallback:', err);
+        if (sessionId !== this.currentSessionId) return;
+        console.warn('ElevenLabs fetch failed, using browser fallback:', err);
       }
     }
 
     // Fallback: Web Speech API
-    this.playWithBrowserTTS({ text, speakerId, onStart, onEnd, onError });
+    if (sessionId === this.currentSessionId) {
+      this.playWithBrowserTTS({ text, speakerId, sessionId, onStart, onEnd, onError });
+    }
   }
 
   /**
-   * Fallback using browser's built-in Web Speech API
-   * Chooses realistic distinct voice pitches and accents for each agent
+   * Fallback using browser's built-in Web Speech API with session protection
    */
-  playWithBrowserTTS({ text, speakerId, onStart, onEnd, onError }) {
+  playWithBrowserTTS({ text, speakerId, sessionId, onStart, onEnd, onError }) {
     if (typeof window === 'undefined' || !('speechSynthesis' in window)) {
       if (onError) onError(new Error('Speech Synthesis not supported in this browser.'));
+      return;
+    }
+
+    if (sessionId && sessionId !== this.currentSessionId) {
       return;
     }
 
@@ -153,37 +184,38 @@ class AudioEngine {
     const voices = this.cachedVoices.length ? this.cachedVoices : window.speechSynthesis.getVoices();
     const englishVoices = voices.filter(v => v.lang.startsWith('en'));
 
-    // Match distinct persona qualities
     if (speakerId === 'moderator') {
-      // British or calm female voice
       const hostVoice = englishVoices.find(v => v.name.includes('Samantha') || v.name.includes('Victoria') || v.name.includes('Karen') || (v.name.includes('Female') && v.lang.includes('GB'))) || englishVoices[0];
       if (hostVoice) utterance.voice = hostVoice;
       utterance.pitch = 1.05;
     } else if (speakerId === 'optimist') {
-      // Energetic male voice
       const maleVoice = englishVoices.find(v => v.name.includes('Daniel') || v.name.includes('Alex') || v.name.includes('David') || (v.name.includes('Male') && !v.name.includes('Female'))) || englishVoices[1] || englishVoices[0];
       if (maleVoice) utterance.voice = maleVoice;
       utterance.pitch = 0.95;
     } else if (speakerId === 'skeptic') {
-      // Analytical crisp voice
       const skepticVoice = englishVoices.find(v => v.name.includes('Zira') || v.name.includes('Moira') || v.name.includes('Google UK English Female') || v.name.includes('Fiona')) || englishVoices[2] || englishVoices[0];
       if (skepticVoice) utterance.voice = skepticVoice;
       utterance.pitch = 1.15;
     }
 
     utterance.onstart = () => {
+      if (sessionId && sessionId !== this.currentSessionId) {
+        window.speechSynthesis.cancel();
+        return;
+      }
       this.isPlaying = true;
       if (onStart) onStart({ mode: 'browser' });
     };
 
     utterance.onend = () => {
+      if (sessionId && sessionId !== this.currentSessionId) return;
       this.isPlaying = false;
       this.activeSpeakerId = null;
       if (onEnd) onEnd();
     };
 
     utterance.onerror = (event) => {
-      // If cancelled intentionally by user interruption, ignore error
+      if (sessionId && sessionId !== this.currentSessionId) return;
       if (event.error === 'canceled' || event.error === 'interrupted') {
         return;
       }

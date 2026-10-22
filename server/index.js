@@ -40,13 +40,25 @@ app.get('/api/voices', (req, res) => {
 app.post('/api/roundtable/turn', async (req, res) => {
   try {
     const {
-      topic = "Will AI replace software developers?",
+      topic = "Will AI replace software developers by 2028?",
       history = [],
       userInterruption = null,
       preferredSpeaker = null,
-      apiKey = process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || null,
-      apiProvider = process.env.GEMINI_API_KEY ? 'gemini' : (process.env.OPENAI_API_KEY ? 'openai' : 'fallback')
+      apiKey: clientKey,
+      apiProvider: clientProvider
     } = req.body;
+
+    const apiKey = (clientKey && clientKey.trim()) || process.env.OPENAI_API_KEY || process.env.GEMINI_API_KEY || null;
+    let apiProvider = clientProvider;
+    if (!apiProvider) {
+      if (apiKey && apiKey.startsWith('sk-')) {
+        apiProvider = 'openai';
+      } else if (apiKey && apiKey.startsWith('AIza')) {
+        apiProvider = 'gemini';
+      } else {
+        apiProvider = 'fallback';
+      }
+    }
 
     const turn = await generateTurn({
       topic,
@@ -68,7 +80,7 @@ app.post('/api/roundtable/turn', async (req, res) => {
 app.post('/api/tts', async (req, res) => {
   try {
     const { text, voiceId, apiKey: clientApiKey } = req.body;
-    const apiKey = clientApiKey || process.env.ELEVENLABS_API_KEY;
+    const apiKey = (clientApiKey && clientApiKey.trim()) || process.env.ELEVENLABS_API_KEY;
 
     if (!text) {
       return res.status(400).json({ error: 'Text is required for TTS' });
@@ -111,7 +123,7 @@ app.get('*', (req, res) => {
   }
   res.sendFile(path.join(distPath, 'index.html'), (err) => {
     if (err) {
-      res.status(200).send('AI Roundtable API Server is running. Launch Vite dev server on port 5173 for client UI.');
+      res.status(200).send('AI Roundtable API Server is running.');
     }
   });
 });

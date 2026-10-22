@@ -27,7 +27,7 @@ export default function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isTopicOpen, setIsTopicOpen] = useState(false);
 
-  // Config State
+  // Config State (Secrets loaded from localStorage or server .env, never hardcoded in git)
   const [config, setConfig] = useState(() => {
     if (typeof window !== 'undefined') {
       try {
@@ -47,7 +47,7 @@ export default function App() {
     };
   });
 
-  // Reference to track autoAdvance inside async callbacks
+  // Trackers to prevent concurrent overlapping speeches
   const autoAdvanceRef = useRef(autoAdvance);
   useEffect(() => {
     autoAdvanceRef.current = autoAdvance;
@@ -57,6 +57,17 @@ export default function App() {
   useEffect(() => {
     isLiveRef.current = isLive;
   }, [isLive]);
+
+  const autoAdvanceTimerRef = useRef(null);
+  const turnRequestIdRef = useRef(0);
+
+  // Clear any pending timer helper
+  const clearAutoAdvanceTimer = () => {
+    if (autoAdvanceTimerRef.current) {
+      clearTimeout(autoAdvanceTimerRef.current);
+      autoAdvanceTimerRef.current = null;
+    }
+  };
 
   // Save config changes
   const handleSaveConfig = (newConfig) => {
@@ -79,9 +90,14 @@ export default function App() {
 
   /**
    * Main turn fetcher & audio trigger
+   * Strict locking: invalidates previous audio & timers to prevent overlap!
    */
   const fetchNextTurn = async ({ userInterruption = null, preferredSpeaker = null } = {}) => {
-    if (isLoading) return;
+    clearAutoAdvanceTimer();
+    audioEngine.stop();
+    setIsSpeaking(false);
+
+    const currentRequestId = ++turnRequestIdRef.current;
 
     setIsLoading(true);
     setIsLive(true);
@@ -95,23 +111,31 @@ export default function App() {
           history,
           userInterruption,
           preferredSpeaker,
-          apiKey: config.geminiApiKey || config.openaiApiKey || null,
-          apiProvider: config.geminiApiKey ? 'gemini' : (config.openaiApiKey ? 'openai' : 'fallback')
+          apiKey: config.openaiApiKey || config.geminiApiKey || null,
+          apiProvider: config.openaiApiKey ? 'openai' : (config.geminiApiKey ? 'gemini' : null)
         })
       });
+
+      if (currentRequestId !== turnRequestIdRef.current) {
+        return;
+      }
 
       if (!response.ok) {
         throw new Error(`Server returned ${response.status}`);
       }
 
       const turn = await response.json();
+
+      if (currentRequestId !== turnRequestIdRef.current) {
+        return;
+      }
+
       const turnWithId = {
         ...turn,
         id: `turn_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
         voiceId: config.voices?.[turn.speakerId] || turn.voiceId
       };
 
-      // Add to conversation history
       setHistory(prev => [...prev, turnWithId]);
       setActiveSpeakerId(turn.speakerId);
       setCurrentSentence(turn.text);
@@ -121,38 +145,43 @@ export default function App() {
         setTimeout(() => setInterruptionStatus(null), 4000);
       }
 
-      // Play audio via ElevenLabs or Browser fallback
       await audioEngine.playSpeech({
         text: turn.text,
         voiceId: turnWithId.voiceId,
         speakerId: turn.speakerId,
         apiKey: config.elevenLabsApiKey,
         onStart: () => {
+          if (currentRequestId !== turnRequestIdRef.current) return;
           setIsSpeaking(true);
           setIsLoading(false);
         },
         onEnd: () => {
+          if (currentRequestId !== turnRequestIdRef.current) return;
           setIsSpeaking(false);
           setActiveSpeakerId(null);
-          // Wait 800ms natural conversational pause, then auto-advance if enabled
+
           if (autoAdvanceRef.current && isLiveRef.current) {
-            setTimeout(() => {
+            clearAutoAdvanceTimer();
+            autoAdvanceTimerRef.current = setTimeout(() => {
               if (autoAdvanceRef.current && isLiveRef.current) {
                 fetchNextTurn();
               }
-            }, 800);
+            }, 900);
           }
         },
         onError: (err) => {
+          if (currentRequestId !== turnRequestIdRef.current) return;
           console.warn('Playback error:', err);
           setIsSpeaking(false);
           setIsLoading(false);
         }
       });
     } catch (error) {
-      console.error('Failed to generate turn:', error);
-      setIsLoading(false);
-      setIsSpeaking(false);
+      if (currentRequestId === turnRequestIdRef.current) {
+        console.error('Failed to generate turn:', error);
+        setIsLoading(false);
+        setIsSpeaking(false);
+      }
     }
   };
 
@@ -161,11 +190,10 @@ export default function App() {
    * Instantly stops currently playing speech and pivots the roundtable
    */
   const handleInterrupt = (interruptionData) => {
-    // 1. Immediately halt audio playback
+    clearAutoAdvanceTimer();
     audioEngine.stop();
     setIsSpeaking(false);
 
-    // 2. Mark the last turn as interrupted
     setHistory(prev => {
       if (prev.length === 0) return prev;
       const updated = [...prev];
@@ -176,7 +204,6 @@ export default function App() {
       return updated;
     });
 
-    // 3. Inject human utterance into history
     const humanTurn = {
       id: `human_${Date.now()}`,
       speakerId: 'listener',
@@ -190,7 +217,6 @@ export default function App() {
     setHistory(prev => [...prev, humanTurn]);
     setInterruptionStatus(`You interrupted! Elena is pivoting the debate...`);
 
-    // 4. Trigger next turn with the interruption context
     const preferredSpeaker = interruptionData.target !== 'all' ? interruptionData.target : null;
     fetchNextTurn({
       userInterruption: interruptionData,
@@ -199,6 +225,7 @@ export default function App() {
   };
 
   const handleTogglePlay = () => {
+    clearAutoAdvanceTimer();
     if (isSpeaking) {
       audioEngine.stop();
       setIsSpeaking(false);
@@ -210,6 +237,7 @@ export default function App() {
   };
 
   const handleResetEpisode = () => {
+    clearAutoAdvanceTimer();
     audioEngine.stop();
     setIsSpeaking(false);
     setActiveSpeakerId(null);
@@ -220,6 +248,7 @@ export default function App() {
   };
 
   const handleReplayTurn = (turn) => {
+    clearAutoAdvanceTimer();
     audioEngine.stop();
     setActiveSpeakerId(turn.speakerId);
     setCurrentSentence(turn.text);
@@ -260,9 +289,9 @@ export default function App() {
           interruptionStatus={interruptionStatus}
           onQuickInterrupt={(text) => handleInterrupt({ text, target: 'all', timestamp: new Date().toISOString() })}
           voiceProfiles={{
-            moderator: { name: 'Rachel / Sarah' },
-            optimist: { name: 'Adam / Josh' },
-            skeptic: { name: 'Nicole / Alice' }
+            moderator: { name: 'Rachel (Host)' },
+            optimist: { name: 'Adam (Optimist)' },
+            skeptic: { name: 'Nicole (Skeptic)' }
           }}
         />
 
